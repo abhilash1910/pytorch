@@ -213,6 +213,14 @@ class UserDefinedClassVariable(UserDefinedVariable):
             ):
                 return VariableBuilder(tx, source)(obj.__get__(self.value))
 
+        if inspect.ismemberdescriptor(obj) or inspect.isdatadescriptor(obj):
+            builder = (
+                VariableBuilder(tx, source)
+                if source
+                else functools.partial(SourcelessBuilder.create, tx=tx)
+            )
+            return builder(value=getattr(self.value, name))
+
         if ConstantVariable.is_literal(obj):
             return ConstantVariable.create(obj)
         elif isinstance(obj, enum.Enum):
