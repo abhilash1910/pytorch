@@ -219,6 +219,8 @@ jobs:
             # since some steps are skipped on s390x, if they are necessary, run them here
             env | grep '^GITHUB' >> "/tmp/github_env_${GITHUB_RUN_ID}"
             env | grep '^CI' >> "/tmp/github_env_${GITHUB_RUN_ID}"
+
+            set -x
           else
             JENKINS_USER_OPT="--user"
             JENKINS_USER="jenkins"
