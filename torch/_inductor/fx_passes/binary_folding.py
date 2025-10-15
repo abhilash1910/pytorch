@@ -480,6 +480,20 @@ def binary_folding_init():
             else:
                 computation_node = binary_node.args[1].args[0]
                 reshape_node = binary_node.args[1]
+                
+            if config.verify_binary_folding:
+                try:
+                    from .binary_folding_z3 import verify_binary_folding_transformation
+                    verified = verify_binary_folding_transformation(match, binary_node, computation_node, other)
+                    if verified:
+                        counters["inductor"]["binary_folding_z3_verified"] += 1
+                    else:
+                        counters["inductor"]["binary_folding_z3_failed"] += 1
+                        if config.strict_binary_folding_verification:
+                            print(f"[Z3] Verification failed for {binary_node.target}")
+                            counters["inductor"]["binary_folding_z3_error"] += 1
+                except ImportError:
+                    pass
             graph = match.graph
             with graph.inserting_before(reshape_node if reshape_node else binary_node):
                 assert computation_node.target in _computation_ops

@@ -291,6 +291,15 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     gm.recompile()
     gm.graph.lint()
+    try:
+        from .binary_folding_z3 import get_verifier
+        verifier = get_verifier()
+        stats = verifier.get_stats()
+        if stats['total'] > 0:
+            log.info(f"[Z3] Binary folding verification: {stats['verified']}/{stats['total']} verified, "
+                    f"{stats['failed']} failed, {stats['skipped']} skipped")
+    except ImportError:
+        pass
 
 
 def prepare_softmax_pattern(x, dim):

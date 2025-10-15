@@ -1939,3 +1939,11 @@ if TYPE_CHECKING:
 
 # adds patch, save_config, etc
 install_config_module(sys.modules[__name__])
+
+
+
+#z3
+
+verify_binary_folding: bool = True
+strict_binary_folding_verification: bool = False
+binary_folding_verification_timeout: int = 5000
