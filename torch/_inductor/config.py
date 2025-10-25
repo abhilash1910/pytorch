@@ -1947,3 +1947,14 @@ install_config_module(sys.modules[__name__])
 verify_binary_folding: bool = True
 strict_binary_folding_verification: bool = False
 binary_folding_verification_timeout: int = 5000
+
+
+verify_pad_mm: bool = True
+strict_pad_mm_verification: bool = False
+pad_mm_verification_timeout: int = 2000
+
+verify_fuse_attention: bool = True
+verify_all_attention_patterns: bool = True  
+strict_attention_verification: bool = False
+attention_verification_timeout: int = 5000
+report_attention_pattern_statistics: bool = True

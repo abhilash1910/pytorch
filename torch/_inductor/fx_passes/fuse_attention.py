@@ -21,6 +21,133 @@ aten = torch.ops.aten
 _scaled_dot_product_attention = aten.scaled_dot_product_attention
 
 
+def z3_sdpa(pattern_num, query, key, value, inv_scale):
+    """Z3 verification for SDPA patterns - no hardcoded defaults."""
+    print(f"[DEBUG Z3] z3_sdpa called: pattern={pattern_num}")
+    from .fuse_attention_z3 import get_verifier
+    from torch._dynamo.utils import counters
+    
+    verifier = get_verifier()
+    
+    q_shape = None
+    k_shape = None
+    v_shape = None
+    
+    try:
+        # Check if it's a tensor-like object with .shape attribute
+        if hasattr(query, 'shape'):
+            q_shape = tuple(query.shape)
+        # Otherwise try FX node metadata
+        elif hasattr(query, 'meta'):
+            if 'tensor_meta' in query.meta:
+                q_shape = tuple(query.meta['tensor_meta'].shape)
+            elif 'val' in query.meta and hasattr(query.meta['val'], 'shape'):
+                q_shape = tuple(query.meta['val'].shape)
+        
+        if hasattr(key, 'shape'):
+            k_shape = tuple(key.shape)
+        elif hasattr(key, 'meta'):
+            if 'tensor_meta' in key.meta:
+                k_shape = tuple(key.meta['tensor_meta'].shape)
+            elif 'val' in key.meta and hasattr(key.meta['val'], 'shape'):
+                k_shape = tuple(key.meta['val'].shape)
+        
+        if hasattr(value, 'shape'):
+            v_shape = tuple(value.shape)
+        elif hasattr(value, 'meta'):
+            if 'tensor_meta' in value.meta:
+                v_shape = tuple(value.meta['tensor_meta'].shape)
+            elif 'val' in value.meta and hasattr(value.meta['val'], 'shape'):
+                v_shape = tuple(value.meta['val'].shape)
+    except Exception as e:
+        print(f"[DEBUG Z3] Exception extracting shapes: {e}")
+        pass
+    
+    # Skip if shapes not available
+    if q_shape is None or k_shape is None or v_shape is None:
+        print(f"[DEBUG Z3] SKIP: Missing shapes")
+        counters["inductor"]["fuse_attention_z3_skipped"] = \
+            counters["inductor"].get("fuse_attention_z3_skipped", 0) + 1
+        return
+    
+    print(f"[DEBUG Z3] Shapes extracted: q={q_shape}, k={k_shape}, v={v_shape}")
+    
+    # Extract scale from parameters
+    inv_scale_val = None
+    try:
+        # Direct numeric value
+        if isinstance(inv_scale, (int, float)):
+            inv_scale_val = float(inv_scale)
+        # FakeTensor or Tensor with .item()
+        elif hasattr(inv_scale, 'item'):
+            inv_scale_val = float(inv_scale.item())
+        # FX node with metadata
+        elif hasattr(inv_scale, 'meta') and 'val' in inv_scale.meta:
+            inv_scale_val = float(inv_scale.meta['val'])
+    except Exception as e:
+        print(f"[DEBUG Z3] Exception extracting scale: {e}")
+        pass
+    
+    # If still no scale, use head_dim from shapes
+    if inv_scale_val is None or inv_scale_val <= 0:
+        try:
+            head_dim = q_shape[-1]
+            inv_scale_val = float(head_dim ** 0.5)
+            print(f"[DEBUG Z3] Using computed scale from head_dim: {inv_scale_val}")
+        except:
+            print(f"[DEBUG Z3] SKIP: Cannot compute scale")
+            counters["inductor"]["fuse_attention_z3_skipped"] = \
+                counters["inductor"].get("fuse_attention_z3_skipped", 0) + 1
+            return
+    else:
+        print(f"[DEBUG Z3] Extracted scale: {inv_scale_val}")
+    
+    # Check for invalid shapes (containing dicts, etc)
+    try:
+        for dim in q_shape:
+            int(dim)
+        for dim in k_shape:
+            int(dim)
+        for dim in v_shape:
+            int(dim)
+    except Exception as e:
+        print(f"[DEBUG Z3] SKIP: Invalid shape dimensions: {e}")
+        counters["inductor"]["fuse_attention_z3_skipped"] = \
+            counters["inductor"].get("fuse_attention_z3_skipped", 0) + 1
+        return
+    
+    print(f"[DEBUG Z3] Calling verify_pattern(pattern={pattern_num}, q={q_shape}, k={k_shape}, v={v_shape}, inv_scale={inv_scale_val})")
+    
+    # Verify with Z3
+    try:
+        verified = verifier.verify_pattern(
+            pattern_num,
+            q_shape=q_shape,
+            k_shape=k_shape,
+            v_shape=v_shape,
+            inv_scale=inv_scale_val
+        )
+        
+        print(f"[DEBUG Z3] Verification result: {verified}")
+        
+        # Update counters
+        if verified:
+            counters["inductor"]["fuse_attention_z3_verified"] = \
+                counters["inductor"].get("fuse_attention_z3_verified", 0) + 1
+            print(f"[DEBUG Z3] VERIFIED!")
+        else:
+            counters["inductor"]["fuse_attention_z3_failed"] = \
+                counters["inductor"].get("fuse_attention_z3_failed", 0) + 1
+            print(f"[DEBUG Z3] FAILED - Z3 returned False")
+    
+    except Exception as e:
+        print(f"[DEBUG Z3]EXCEPTION during verification: {e}")
+        import traceback
+        traceback.print_exc()
+        counters["inductor"]["fuse_attention_z3_failed"] = \
+            counters["inductor"].get("fuse_attention_z3_failed", 0) + 1
+
+    
 def _sfdp_pattern_1(query, key, value, inv_scale):
     return (
         torch.matmul(query, key.transpose(-2, -1))
@@ -31,6 +158,7 @@ def _sfdp_pattern_1(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_1(query, key, value, inv_scale):
+    z3_sdpa(1,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -53,6 +181,7 @@ def _sfdp_pattern_2(query, key, value, scale_factor):
 
 
 def _sfdp_replacement_2(query, key, value, scale_factor):
+    z3_sdpa(2, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -75,6 +204,7 @@ def _sfdp_pattern_3(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_replacement_3(query, key, value, inv_scale_factor, dropout_p):
+    z3_sdpa(3, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -95,6 +225,7 @@ def _sfdp_pattern_4(query, key, value, scale_factor, dropout_p):
 
 
 def _sfdp_replacement_4(query, key, value, scale_factor, dropout_p):
+    z3_sdpa(4, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -116,6 +247,7 @@ def _sfdp_pattern_5(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_5(query, key, value, attn_mask):
+    z3_sdpa(5, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -136,6 +268,7 @@ def _sfdp_pattern_6(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_6(query, key, value, attn_mask, dropout_p):
+    z3_sdpa(6, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -163,6 +296,7 @@ def _sfdp_pattern_7(query, key, value, dropout_p):
 
 
 def _sfdp_replacement_7(query, key, value, dropout_p):
+    z3_sdpa(7, query, key, value, inv_scale)
     # sdpa prefers inputs in permuted format
     # it makes a copy to put them in this format
     # if they aren't already
@@ -195,6 +329,7 @@ def _sfdp_pattern_8(query, key, value):
 
 
 def _sfdp_replacement_8(query, key, value):
+    z3_sdpa(8, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -223,6 +358,7 @@ def _sfdp_pattern_9(query, key, value, dropout_p):
 
 
 def _sfdp_replacement_9(query, key, value, dropout_p):
+    z3_sdpa(9,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -251,6 +387,7 @@ def _sfdp_pattern_10(query, key, value):
 
 
 def _sfdp_replacement_10(query, key, value):
+    z3_sdpa(10, query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -274,6 +411,7 @@ def _sfdp_pattern_11(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_11(query, key, value, inv_scale):
+    z3_sdpa(11,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -297,6 +435,7 @@ def _sfdp_pattern_12(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_replacement_12(query, key, value, inv_scale_factor, dropout_p):
+    z3_sdpa(12,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -316,6 +455,7 @@ def _sfdp_pattern_13(query, key, value, dropout_p):
 
 
 def _sfdp_replacement_13(query, key, value, dropout_p):
+    z3_sdpa(13,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.unsqueeze(0),
@@ -340,6 +480,7 @@ def _sfdp_pattern_14(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_14(query, key, value, attn_mask, inv_scale):
+    z3_sdpa(14,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -369,6 +510,7 @@ def _sfdp_pattern_15(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_15(query, key, value, attn_mask, inv_scale):
+    z3_sdpa(15,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
@@ -407,6 +549,7 @@ def _sfdp_pattern_16(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_16(query, key, value, attn_mask, inv_scale, dropout_p):
+    z3_sdpa(16,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -439,6 +582,7 @@ def _sfdp_pattern_17(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_17(query, key, value, attn_mask, inv_scale, dropout_p):
+    z3_sdpa(17,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
@@ -489,6 +633,7 @@ def _sfdp_pattern_18(query, key, value, causal_mask, dropout_p):
 
 
 def _sfdp_replacement_18(query, key, value, causal_mask, dropout_p):
+    z3_sdpa(18,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     permuted_key = key.transpose(1, 2)
     permuted_value = value.transpose(1, 2)
@@ -527,6 +672,7 @@ def _sfdp_pattern_19(query, key, value, causal_mask, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_19(query, key, value, causal_mask, attn_mask, dropout_p):
+    z3_sdpa(19,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     fill_value = torch.full((), -float("inf"), dtype=query.dtype, device=query.device)
     attn_mask = torch.where(causal_mask, attn_mask, fill_value)
@@ -561,6 +707,7 @@ def _sfdp_pattern_20(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_20(query, key, value, attn_mask, dropout_p):
+    z3_sdpa(20,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
@@ -606,6 +753,7 @@ def _sfdp_pattern_24(query, key, value, attention_mask):
 
 
 def _sfdp_replacement_24(query, key, value, attention_mask):
+    z3_sdpa(24,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -635,6 +783,7 @@ def _sfdp_pattern_21(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_21(query, key, value, attn_mask):
+    z3_sdpa(21,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -667,6 +816,7 @@ def _sfdp_pattern_22(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_22(query, key, value, attn_mask):
+    z3_sdpa(22,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -705,6 +855,7 @@ def _sfdp_pattern_23(query, key, value):
 
 
 def _sfdp_replacement_23(query, key, value):
+    z3_sdpa(23,query, key, value, inv_scale)
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)

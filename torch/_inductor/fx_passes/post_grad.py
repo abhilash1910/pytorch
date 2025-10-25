@@ -298,6 +298,63 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         if stats['total'] > 0:
             log.info(f"[Z3] Binary folding verification: {stats['verified']}/{stats['total']} verified, "
                     f"{stats['failed']} failed, {stats['skipped']} skipped")
+        from .pad_mm_z3 import get_verifier
+        verifier = get_verifier()
+        stats = verifier.get_stats()
+        if stats['total'] > 0:
+            import logging
+            log = logging.getLogger(__name__)
+            log.info(
+                f"[Z3] Pad MM verification: {stats['verified']}/{stats['total']} verified, "
+                f"{stats['failed']} failed, {stats['skipped']} skipped"
+            )
+        
+        
+        #=================sdpa=====
+        from .fuse_attention import _sfdp_init
+        _sfdp_init()
+        
+        if config.verify_fuse_attention:
+            from torch._dynamo.utils import counters
+            
+            fuse_count = counters["inductor"].get("fuse_attention", 0)
+            z3_verified = counters["inductor"].get("fuse_attention_z3_verified", 0)
+            z3_failed = counters["inductor"].get("fuse_attention_z3_failed", 0)
+            
+            if config.report_attention_pattern_statistics:
+                pattern_map = counters["inductor"].get("fuse_attention_pattern_map", {})
+                verified_patterns = counters["inductor"].get("fuse_attention_verified_patterns", [])
+                
+                if fuse_count > 0:
+                    print(f"[Z3 SDPA Fusion] Total: {fuse_count}, "
+                          f"Verified: {z3_verified}, Failed: {z3_failed}")
+                    
+                    if config.verify_all_attention_patterns and pattern_map:
+                        verified_count = sum(1 for v in pattern_map.values() if v)
+                        print(f"[Z3 Pattern Map] {verified_count}/24 patterns verified")
+                        print(f"[Z3 Verified Patterns] {verified_patterns}")
+        
+        # ===== STANDALONE GRAPH VERIFICATION (WORKS WITH FUSION_COUNT=0) =====
+        if config.verify_fuse_attention and fuse_count == 0:
+            # If fusion_count = 0, try standalone graph verification
+            try:
+                from .fuse_attention_z3 import verify_graph_attention_with_z3
+                
+                print("[Z3] No fusions detected, running standalone graph verification...")
+                results = verify_graph_attention_with_z3(gm, verbose=config.report_attention_pattern_statistics)
+                
+                if results['verified'] > 0:
+                    print(f"[Z3 Graph Verification] Found and verified {results['verified']} SDPA node(s)")
+                    
+                    # Store pattern statistics
+                    if 'pattern_statistics' in results:
+                        counters["inductor"]["graph_pattern_statistics"] = results['pattern_statistics']
+            
+            except Exception as e:
+                if config.strict_attention_verification:
+                    raise
+                else:
+                    print(f"[Z3] Graph verification failed: {e}")
     except ImportError:
         pass
 

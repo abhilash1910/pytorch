@@ -162,6 +162,24 @@ def pad_addmm(
     mat1_pre_padded: bool = False,
     mat2_pre_padded: bool = False,
 ) -> Tensor:
+    from torch._inductor import config
+    if config.verify_pad_mm:
+        from .pad_mm_z3 import get_verifier, DimensionVerifier
+        
+        m = mat1.shape[0]
+        k = mat1.shape[1]
+        k2 = mat2.shape[0]
+        n = mat2.shape[1]
+        bias_shape = list(input.shape) if input is not None else []
+        
+        verified, msg = DimensionVerifier.verify_addmm_dims(bias_shape, m, k, k2, n)
+        
+        if not verified:
+            counters["inductor"]["pad_mm_z3_failed"] += 1
+            if config.strict_pad_mm_verification:
+                raise RuntimeError(f"[Z3] Pad AddMM verification FAILED: {msg}")
+        else:
+            counters["inductor"]["pad_mm_z3_verified"] += 1
     # for paddings, dim order is reversed for some reasons
     # and for every dim, we need to specify left and right padding
     if not mat1_pre_padded:
@@ -767,6 +785,30 @@ def pad_mm(
     mat1_pre_padded: bool = False,
     mat2_pre_padded: bool = False,
 ) -> Tensor:
+    from torch._inductor import config
+    if config.verify_pad_mm:
+        from .pad_mm_z3 import get_verifier
+        verifier = get_verifier()
+        
+        m = mat1.shape[0]
+        k = mat1.shape[1]
+        n = mat2.shape[1]
+        dtype = mat1.dtype
+        alignment = get_alignment_size(mat1)
+        
+        verified = verifier.verify_mm_padding(
+            m, k, n, m_padded_length, k_padded_length, n_padded_length, dtype, alignment
+        )
+        
+        if not verified:
+            counters["inductor"]["pad_mm_z3_failed"] += 1
+            if config.strict_pad_mm_verification:
+                raise RuntimeError(
+                    f"[Z3] Pad MM verification FAILED: [{m},{k}]@[{k},{n}] "
+                    f"with pads ({m_padded_length},{k_padded_length},{n_padded_length})"
+                )
+        else:
+            counters["inductor"]["pad_mm_z3_verified"] += 1
     if not mat1_pre_padded:
         mat1 = pad_mat1(
             mat1, m_padded_length=m_padded_length, k_padded_length=k_padded_length
@@ -816,6 +858,25 @@ def pad_bmm(
     mat1_pre_padded: bool = False,
     mat2_pre_padded: bool = False,
 ) -> Tensor:
+    from torch._inductor import config
+    if config.verify_pad_mm:
+        from .pad_mm_z3 import get_verifier, DimensionVerifier
+        
+        b1 = mat1.shape[0]
+        m = mat1.shape[1]
+        k = mat1.shape[2]
+        b2 = mat2.shape[0]
+        k2 = mat2.shape[1]
+        n = mat2.shape[2]
+        
+        verified, msg = DimensionVerifier.verify_bmm_dims(b1, m, k, b2, k2, n)
+        
+        if not verified:
+            counters["inductor"]["pad_mm_z3_failed"] += 1
+            if config.strict_pad_mm_verification:
+                raise RuntimeError(f"[Z3] Pad BMM verification FAILED: {msg}")
+        else:
+            counters["inductor"]["pad_mm_z3_verified"] += 1
     if not mat1_pre_padded:
         mat1 = pad_mat1(
             mat1,
