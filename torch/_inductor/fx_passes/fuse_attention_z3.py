@@ -22,6 +22,7 @@ from typing import Tuple, Optional, Dict, Any
 import math
 import torch
 
+from torch._dynamo.utils import counters
 
 class SDPAPattern1Verifier:
     """
@@ -1154,6 +1155,11 @@ def verify_graph_attention_with_z3(gm, verifier=None, verbose=True):
             print("? ALL SDPA NODES FORMALLY VERIFIED BY Z3!")
             print("   Your attention mechanisms are mathematically correct!")
             print("="*70)
+            
+    counters['inductor']['fuse_attention_z3_total_nodes'] += results['total_sdpa_nodes']
+    counters['inductor']['fuse_attention_z3_verified'] += results['verified']
+    counters['inductor']['fuse_attention_z3_failed'] += results['failed']
+    counters['inductor']['fuse_attention_z3_skipped'] += results['skipped']
     
     return results
 

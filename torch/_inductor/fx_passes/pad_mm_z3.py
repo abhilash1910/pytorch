@@ -180,6 +180,211 @@ class PaddingMatrixVerifier:
             return (True, f"Padding structure valid: {p} border padding for {m}x{n} matrix")
         return (False, f"Structure check failed for m={m}, n={n}, p={p}")
 
+class GQAStrideVerifier:
+    """
+    Verifies Grouped Query Attention (GQA) stride and shape correctness.
+    
+    GQA Issues (PyTorch Issue #159469):
+    - When Q heads != KV heads and sequence length is odd
+    - Stride calculations can produce incorrect results
+    - This leads to NaN gradients in backward pass
+    
+    Checks:
+    1. Head ratio validity (H_q % H_kv == 0)
+    2. Sequence length alignment for padding safety
+    3. Stride continuity after transpose operations
+    4. GQA broadcast dimension correctness
+    """
+    
+    @staticmethod
+    def verify_gqa_head_ratio(h_q: int, h_kv: int) -> Tuple[bool, str]:
+        """
+        Verify GQA head ratio is valid.
+        Q heads must be divisible by KV heads for proper broadcasting.
+        """
+        s = Solver()
+        s.set("timeout", 1000)
+        
+        h_q_z3 = Int('h_q')
+        h_kv_z3 = Int('h_kv')
+        ratio = Int('ratio')
+        remainder = Int('remainder')
+        
+        s.add(h_q_z3 == IntVal(h_q))
+        s.add(h_kv_z3 == IntVal(h_kv))
+        s.add(h_q_z3 > 0)
+        s.add(h_kv_z3 > 0)
+        
+        # Check divisibility
+        s.add(ratio == h_q_z3 / h_kv_z3)
+        s.add(remainder == h_q_z3 % h_kv_z3)
+        
+        # Valid GQA requires H_q % H_kv == 0
+        s.add(remainder == 0)
+        s.add(ratio >= 1)
+        
+        if s.check() == sat:
+            model = s.model()
+            ratio_val = model[ratio].as_long()
+            return (True, f"GQA head ratio valid: {h_q}/{h_kv} = {ratio_val}:1")
+        return (False, f"INVALID GQA: H_q={h_q} not divisible by H_kv={h_kv} (remainder={h_q % h_kv})")
+    
+    @staticmethod
+    def verify_gqa_sequence_alignment(seq_len: int, alignment: int = 8) -> Tuple[bool, str]:
+        """
+        Verify sequence length alignment for GQA.
+        
+        WARNING: Odd sequence lengths with GQA can cause NaN gradients!
+        (PyTorch Issue #159469)
+        """
+        s = Solver()
+        s.set("timeout", 1000)
+        
+        seq = Int('seq')
+        align = Int('align')
+        remainder = Int('remainder')
+        is_odd = Bool('is_odd')
+        
+        s.add(seq == IntVal(seq_len))
+        s.add(align == IntVal(alignment))
+        s.add(remainder == seq % align)
+        s.add(is_odd == (seq % 2 != 0))
+        
+        if s.check() == sat:
+            model = s.model()
+            rem = model[remainder].as_long()
+            odd = seq_len % 2 != 0
+            
+            issues = []
+            if odd:
+                issues.append("ODD sequence length (DANGER: may cause NaN with GQA!)")
+            if rem != 0:
+                issues.append(f"Not aligned to {alignment} (needs padding of {alignment - rem})")
+            
+            if issues:
+                return (False, f"GQA sequence issues: {'; '.join(issues)}")
+            return (True, f"GQA sequence length {seq_len} is aligned and even")
+        return (False, f"GQA sequence verification failed for seq_len={seq_len}")
+    
+    @staticmethod
+    def verify_gqa_stride_safety(batch: int, h_q: int, h_kv: int, seq_len: int, head_dim: int) -> Tuple[bool, str]:
+        """
+        Verify stride calculations are safe for GQA.
+        
+        The bug occurs when:
+        1. GQA is enabled (H_q != H_kv)
+        2. Sequence length is odd
+        3. After transpose, strides become non-contiguous
+        
+        Stride calculation for Q: (B, H_q, S, D) after transpose(-2, -3)
+        Expected stride: (H_q*S*D, S*D, D, 1) -> (H_q*S*D, D, S*D, 1)
+        """
+        s = Solver()
+        s.set("timeout", 2000)
+        
+        B = Int('B')
+        H_q = Int('H_q')
+        H_kv = Int('H_kv')
+        S = Int('S')
+        D = Int('D')
+        
+        s.add(B == IntVal(batch))
+        s.add(H_q == IntVal(h_q))
+        s.add(H_kv == IntVal(h_kv))
+        s.add(S == IntVal(seq_len))
+        s.add(D == IntVal(head_dim))
+        
+        # All must be positive
+        s.add(B > 0)
+        s.add(H_q > 0)
+        s.add(H_kv > 0)
+        s.add(S > 0)
+        s.add(D > 0)
+        
+        # GQA constraint
+        s.add(H_q % H_kv == 0)
+        
+        # Calculate expected strides before transpose: (B, H, S, D)
+        # Contiguous stride: (H*S*D, S*D, D, 1)
+        stride_0 = Int('stride_0')
+        stride_1 = Int('stride_1')
+        stride_2 = Int('stride_2')
+        stride_3 = Int('stride_3')
+        
+        s.add(stride_3 == 1)
+        s.add(stride_2 == D)
+        s.add(stride_1 == S * D)
+        s.add(stride_0 == H_q * S * D)
+        
+        # After transpose(-2, -3): (B, S, H, D)
+        # Strides become: (H*S*D, D, S*D, 1)
+        trans_stride_0 = stride_0  # B dimension unchanged
+        trans_stride_1 = stride_2  # S gets D's stride
+        trans_stride_2 = stride_1  # H gets S*D stride
+        trans_stride_3 = stride_3  # D unchanged
+        
+        # Check if transposed tensor is contiguous
+        # For contiguous after transpose: stride[i] = stride[i+1] * size[i+1]
+        # After transpose, sizes are: (B, S, H, D)
+        is_contiguous = Bool('is_contiguous')
+        s.add(is_contiguous == And(
+            trans_stride_2 == trans_stride_3 * D,  # H stride == D stride * D
+            trans_stride_1 == trans_stride_2 * H_q,  # S stride == H stride * H
+            trans_stride_0 == trans_stride_1 * S  # B stride == S stride * S
+        ))
+        
+        # GQA broadcast check: When H_q != H_kv, K and V need broadcasting
+        gqa_ratio = Int('gqa_ratio')
+        s.add(gqa_ratio == H_q / H_kv)
+        
+        # The problematic case: odd S with GQA
+        is_problematic = Bool('is_problematic')
+        s.add(is_problematic == And(
+            H_q != H_kv,  # GQA enabled
+            S % 2 != 0,   # Odd sequence length
+        ))
+        
+        if s.check() == sat:
+            model = s.model()
+            is_cont = model.eval(is_contiguous)
+            is_prob = model.eval(is_problematic)
+            gqa_r = model[gqa_ratio].as_long()
+            
+            if is_prob:
+                return (False, f"DANGER: GQA with odd seq_len={seq_len}! GQA ratio: {gqa_r}:1")
+            if not is_cont:
+                return (False, f"Non-contiguous stride after transpose. GQA ratio: {gqa_r}:1")
+            return (True, f"GQA stride safe: B={batch}, H_q={h_q}, H_kv={h_kv}, S={seq_len}, D={head_dim}, GQA ratio: {gqa_r}:1")
+        return (False, f"GQA stride verification failed")
+    
+    @staticmethod
+    def verify_gqa_full(batch: int, h_q: int, h_kv: int, seq_len: int, head_dim: int, alignment: int = 8) -> Tuple[bool, List[str]]:
+        """
+        Full GQA verification combining all checks.
+        
+        Returns (is_safe, list_of_issues)
+        """
+        issues = []
+        
+        # Check 1: Head ratio
+        valid, msg = GQAStrideVerifier.verify_gqa_head_ratio(h_q, h_kv)
+        if not valid:
+            issues.append(msg)
+        
+        # Check 2: Sequence alignment
+        valid, msg = GQAStrideVerifier.verify_gqa_sequence_alignment(seq_len, alignment)
+        if not valid:
+            issues.append(msg)
+        
+        # Check 3: Stride safety
+        valid, msg = GQAStrideVerifier.verify_gqa_stride_safety(batch, h_q, h_kv, seq_len, head_dim)
+        if not valid:
+            issues.append(msg)
+        
+        is_safe = len(issues) == 0
+        return (is_safe, issues)
+
+
 
 class ConvolutionPaddingVerifier:
     """
@@ -882,7 +1087,40 @@ class PadMMZ3Verifier:
         log.debug(f"[Z3] Conv padding verified: {m}x{n}, kernel {k}x{k}, stride {s}, pad {p} -> {out_h}x{out_w}")
         self.stats['verified'] += 1
         return True
-    
+    def verify_gqa(self, batch: int, h_q: int, h_kv: int, seq_len: int, head_dim: int, 
+                   alignment: int = 8) -> Tuple[bool, List[str]]:
+        """
+        Verify GQA (Grouped Query Attention) configuration for safety.
+        
+        Detects Issue #159469: GQA with odd sequence lengths can cause NaN gradients.
+        
+        Args:
+            batch: Batch size
+            h_q: Number of query heads
+            h_kv: Number of key/value heads
+            seq_len: Sequence length
+            head_dim: Head dimension
+            alignment: Memory alignment (default 8 for bfloat16)
+            
+        Returns:
+            (is_safe, list_of_issues)
+        """
+        self.stats['total'] += 1
+        
+        is_safe, issues = GQAStrideVerifier.verify_gqa_full(
+            batch, h_q, h_kv, seq_len, head_dim, alignment
+        )
+        
+        if is_safe:
+            self.stats['verified'] += 1
+            log.debug(f"[Z3] GQA verified safe: B={batch}, H_q={h_q}, H_kv={h_kv}, S={seq_len}, D={head_dim}")
+        else:
+            self.stats['failed'] += 1
+            for issue in issues:
+                log.warning(f"[Z3] GQA issue: {issue}")
+        
+        return is_safe, issues
+
     def get_stats(self):
         return self.stats.copy()
     
@@ -898,4 +1136,6 @@ def get_verifier() -> PadMMZ3Verifier:
         _verifier_instance = PadMMZ3Verifier()
     return _verifier_instance
 
+def get_gqa_verifier():
+    return get_verifier()
 

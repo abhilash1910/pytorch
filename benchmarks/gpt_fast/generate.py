@@ -444,6 +444,7 @@ def run_mixtral_8x7b_int8(device: str = "cuda"):
 
 
 # token_per_sec and memory_bandwidth target numbers are for A100-40GB, which are different from the typical A100-80GB.
+@register_experiment(name="llama2_7b_autoquant")
 def run_llama2_7b_autoquant(device: str = "cuda"):
     model = GPTModelConfig(
         "Llama-2-7b-chat-hf",
