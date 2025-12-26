@@ -63,6 +63,9 @@ from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
 from .reinplace import reinplace_inplaceable_ops
 from .split_cat import POST_GRAD_PATTERNS
+from .reinplace_z3 import Z3ReinplaceVerifier
+
+reinplace_z3_enabled = True
 
 
 _T = TypeVar("_T")
@@ -79,6 +82,134 @@ pass_patterns = [
     PatternMatcherPass(),
 ]
 
+def reinplace_with_z3(fake_tensor_updater, graph: torch.fx.Graph):
+    if not config.reinplace_z3_enabled:
+        return reinplace_inplaceable_ops(fake_tensor_updater, graph)
+    
+    try:
+        import z3
+    except ImportError:
+        log.warning("Z3 verification requested but z3-solver not installed")
+        return reinplace_inplaceable_ops(fake_tensor_updater, graph)
+    
+    # Run reinplace FIRST
+    result = reinplace_inplaceable_ops(fake_tensor_updater, graph)
+    
+    # Now verify correctness AFTER reinplace has run
+    verifier = Z3ReinplaceVerifier()
+    
+    # Build node ordering
+    node_list = list(graph.nodes)
+    for idx, node in enumerate(node_list):
+        node_var = verifier.create_node_var(f"node_{idx}")
+        verifier.solver.add(verifier.node_order(node_var) == idx)
+        node.meta['z3_order'] = idx
+        node.meta['z3_var'] = node_var
+    
+    # Build storage-to-nodes mapping
+    storage_to_nodes = {}
+    for node in graph.nodes:
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            try:
+                storage = get_node_storage(node)
+                if storage is not None:
+                    if storage not in storage_to_nodes:
+                        storage_to_nodes[storage] = []
+                    storage_to_nodes[storage].append(node)
+            except Exception:
+                pass
+    
+    # Check every mutation node
+    violations_found = 0
+    
+    for node in graph.nodes:
+        # Check if this node was reinplaced
+        if not node.meta.get("reinplaced", False):
+            continue
+        
+        # Find which arguments are actually mutated using schema
+        # This is CRITICAL: different ops mutate different args
+        # Examples:
+        #   aten.add_(a, b)           -> only arg[0] (a) is mutated
+        #   aten.scatter_(self, ...)  -> only arg[0] (self) is mutated
+        #   aten.index_put_(a, ...)   -> only arg[0] (a) is mutated
+        # We must check schema.arguments[i].alias_info.is_write
+        mutated_args = []
+        
+        if isinstance(node.target, torch._ops.OpOverload):
+            # Use schema to find mutable arguments
+            schema = node.target._schema
+            for i, schema_arg in enumerate(schema.arguments):
+                if schema_arg.alias_info and schema_arg.alias_info.is_write:
+                    if i < len(node.args) and isinstance(node.args[i], fx.Node):
+                        mutated_args.append(node.args[i])
+        
+        if not mutated_args:
+            continue
+        
+        # Check each mutated argument
+        for mutated_arg in mutated_args:
+            # Get all tensors that alias with the mutated argument
+            try:
+                mutated_storage = get_node_storage(mutated_arg)
+            except Exception:
+                continue
+            
+            aliasing_views = storage_to_nodes.get(mutated_storage, [])
+            if not aliasing_views:
+                continue
+            
+            # For each aliasing view, check all its users
+            mutation_order = node.meta['z3_order']
+            
+            for view in aliasing_views:
+                if view == mutated_arg:
+                    continue  # Skip the mutated tensor itself
+                
+                # Check all users of this view
+                for user in view.users:
+                    user_order = user.meta.get('z3_order')
+                    if user_order is None:
+                        continue
+                    
+                    # Check temporal ordering: does user come after mutation?
+                    if user_order <= mutation_order:
+                        continue  # User before mutation, safe
+                    
+                    # User comes after mutation - check if it's allowed
+                    
+                    # Allow copy_epilogue
+                    if user.target in [torch.ops.aten.copy_.default]:
+                        # Check if it's copying back to original
+                        if len(user.args) >= 2 and user.args[0] == mutated_arg:
+                            continue  # This is copy epilogue, allowed
+                    
+                    # Allow meta-only operations
+                    if user.target in verifier.meta_only_ops:
+                        continue
+                    
+                    # Violation detected!
+                    # A user of an aliasing view observes the mutation
+                    violations_found += 1
+                    node.meta['z3_reinplace_violation'] = True
+                    user.meta['z3_violating_user'] = True
+                    
+                    log.error(
+                        f"Z3 reinplace violation: "
+                        f"node {node.name} mutates {mutated_arg.name}, "
+                        f"but {user.name} uses aliasing view {view.name} "
+                        f"after mutation (order: {mutation_order} -> {user_order})"
+                    )
+                    
+                    counters["inductor"]["z3_reinplace_violation"] += 1
+    
+    if violations_found == 0:
+        log.info(f"Z3: All reinplace operations verified correct")
+    
+    counters["inductor"]["z3_reinplace_verified"] += 1
+    return result
+    
 
 def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     """
@@ -269,9 +400,15 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     # Keep these last, since they introduce mutation. Look at
     # ./fx_passes/README.md for a discussion of mutation invariants.
+    
+    # Replace with z3 variant
+    #GraphTransformObserver(gm, "reinplace_inplaceable_ops").apply_graph_pass(
+    #    functools.partial(reinplace_inplaceable_ops, fake_tensor_updater),
+    #)
     GraphTransformObserver(gm, "reinplace_inplaceable_ops").apply_graph_pass(
-        functools.partial(reinplace_inplaceable_ops, fake_tensor_updater),
+        functools.partial(reinplace_with_z3, fake_tensor_updater),
     )
+    
     GraphTransformObserver(
         gm, "decompose_triton_kernel_wrapper_functional"
     ).apply_graph_pass(decompose_triton_kernel_wrapper_functional)
