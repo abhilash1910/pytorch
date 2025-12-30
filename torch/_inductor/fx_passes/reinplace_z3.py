@@ -5,7 +5,7 @@ import operator
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, cast, Union
+from typing import Any, Callable, cast, Union, Tuple
 
 import z3
 from z3 import *
@@ -22,6 +22,8 @@ get_node_storage = z3.Function('get_node_storage', NodeSort, StorageSort)
 is_node_realized = z3.Function('is_node_realized', NodeSort, z3.BoolSort())
 node_order = z3.Function('node_order', NodeSort, z3.IntSort())
 is_view_op = z3.Function('is_view_op', OpSort, z3.BoolSort())
+has_storage = z3.Function('has_storage', NodeSort, z3.BoolSort())
+alias = z3.Function('alias', NodeSort, NodeSort, z3.BoolSort())
 compute_overlapping_tensors = z3.Function('compute_overlapping_tensors', 
                                         z3.ArraySort(z3.IntSort(), TensorSort), 
                                         z3.IntSort())
@@ -50,6 +52,12 @@ class Z3ReinplaceVerifier:
         self.storage_vars = {}
         self.graph_vars = {}
         
+        self.has_storage = has_storage
+        self.alias = alias
+        self.node_order = node_order
+        self.get_node_storage = get_node_storage
+        self.is_node_realized = is_node_realized
+        
         self._setup_base_constraints()
         self._scatter_op_to_view = {
             'aten.diagonal_scatter.default': 'aten.diagonal.default',
@@ -71,13 +79,77 @@ class Z3ReinplaceVerifier:
         }
     
     def _setup_base_constraints(self):
+        n1, n2, n3 = z3.Consts('n1 n2 n3', NodeSort)
+        
+        # Axiom 1: Aliasing definition - nodes alias if they have same storage
+        self.solver.add(
+            z3.ForAll(
+                [n1, n2],
+                z3.Implies(
+                    z3.And(self.has_storage(n1), self.has_storage(n2)),
+                    self.alias(n1, n2) == (get_node_storage(n1) == get_node_storage(n2))
+                )
+            )
+        )
+        
+        # Axiom 2: Aliasing is reflexive
+        self.solver.add(
+            z3.ForAll(
+                [n1],
+                z3.Implies(self.has_storage(n1), self.alias(n1, n1))
+            )
+        )
+        
+        # Axiom 3: Aliasing is symmetric
+        self.solver.add(
+            z3.ForAll(
+                [n1, n2],
+                z3.Implies(self.alias(n1, n2), self.alias(n2, n1))
+            )
+        )
+        
+        # Axiom 4: Aliasing is transitive
+        self.solver.add(
+            z3.ForAll(
+                [n1, n2, n3],
+                z3.Implies(
+                    z3.And(self.alias(n1, n2), self.alias(n2, n3)),
+                    self.alias(n1, n3)
+                )
+            )
+        )
+        
+        # Axiom 5: node_order is transitive
+        self.solver.add(
+            z3.ForAll(
+                [n1, n2, n3],
+                z3.Implies(
+                    z3.And(node_order(n1) < node_order(n2), node_order(n2) < node_order(n3)),
+                    node_order(n1) < node_order(n3)
+                )
+            )
+        )
+    
+    '''
+    def _setup_base_constraints(self):
         """Setup base Z3 constraints for tensor operations"""
         node_uses_tensor = z3.Function("node_uses_tensor",  NodeSort, TensorSort, z3.BoolSort())
         alias = z3.Function('alias', TensorSort, TensorSort, z3.BoolSort())
+        has_storage = z3.Function("has_storage", TensorSort, z3.BoolSort())
         t1, t2 = z3.Consts('t1 t2', TensorSort)
-        self.solver.add(z3.ForAll([t1, t2],
-            alias(t1, t2) == (get_node_storage(t1) == get_node_storage(t2))
-        ))
+        #self.solver.add(z3.ForAll([t1, t2],
+        #    alias(t1, t2) == (get_node_storage(t1) == get_node_storage(t2))
+        #))
+        #self.solver.add(
+        #z3.ForAll(
+        #    [t1, t2],
+        #    z3.Implies(
+        #        z3.And(has_storage(t1), has_storage(t2)),
+        #        alias(t1, t2)
+        #        == (get_node_storage(t1) == get_node_storage(t2)),
+        #        ),
+        #    )
+        #)
         t = z3.Const('t', NodeSort)
         self.solver.add(z3.ForAll([t], get_node_storage(t) == get_node_storage(t)))
         n1, n2, n3 = z3.Consts('n1 n2 n3', NodeSort)
@@ -85,6 +157,7 @@ class Z3ReinplaceVerifier:
             z3.Implies(z3.And(node_order(n1) < node_order(n2),
                              node_order(n2) < node_order(n3)),
                       node_order(n1) < node_order(n3))))
+        '''
     
     def create_node_var(self, name: str) -> z3.ExprRef:
         """Create a Z3 node variable"""

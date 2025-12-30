@@ -83,7 +83,7 @@ pass_patterns = [
 ]
 
 def reinplace_with_z3(fake_tensor_updater, graph: torch.fx.Graph):
-    if not config.reinplace_z3_enabled:
+    if not reinplace_z3_enabled:
         return reinplace_inplaceable_ops(fake_tensor_updater, graph)
     
     try:
@@ -433,6 +433,8 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         verifier = get_verifier()
         stats = verifier.get_stats()
         if stats['total'] > 0:
+            import logging
+            log = logging.getLogger(__name__)
             log.info(f"[Z3] Binary folding verification: {stats['verified']}/{stats['total']} verified, "
                     f"{stats['failed']} failed, {stats['skipped']} skipped")
         from .pad_mm_z3 import get_verifier
