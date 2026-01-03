@@ -64,9 +64,10 @@ from .pre_grad import is_same_dict, save_inductor_dict
 from .reinplace import reinplace_inplaceable_ops
 from .split_cat import POST_GRAD_PATTERNS
 from .reinplace_z3 import Z3ReinplaceVerifier
+from .split_cat_z3 import Z3SplitCatVerifier
 
 reinplace_z3_enabled = True
-
+splitcat_z3_enabled = True
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -209,7 +210,157 @@ def reinplace_with_z3(fake_tensor_updater, graph: torch.fx.Graph):
     
     counters["inductor"]["z3_reinplace_verified"] += 1
     return result
+
+def verify_splitcat_with_z3(graph: torch.fx.Graph) -> None:
+    """
+    Z3 verification hook for split-cat optimizations.
     
+    Runs after split-cat pattern matching passes to verify:
+    1. Split-cat identity: split followed by cat of all pieces equals identity
+    2. Partial slice: concatenating consecutive pieces equals slice
+    3. Dimension consistency: split_dim == cat_dim for identity
+    4. Contiguous ranges: no gaps in merged ranges
+    5. Consecutive indices: getitem indices are sorted and consecutive
+    """
+    if not splitcat_z3_enabled:
+        return
+    
+    try:
+        from .split_cat_z3 import get_verifier
+    except ImportError:
+        log.warning("splitcat_z3_model not available, skipping verification")
+        return
+    
+    verifier = get_verifier()
+    
+    # Find split nodes and their cat users
+    split_nodes = []
+    for node in graph.nodes:
+        if node.target in (torch.split, torch.ops.aten.split.Tensor, 
+                           torch.ops.aten.split_with_sizes.default):
+            split_nodes.append(node)
+    
+    for split_node in split_nodes:
+        # Get split parameters
+        split_input = get_arg_value(split_node, 0, "tensor") or get_arg_value(split_node, 0)
+        split_sections = get_arg_value(split_node, 1, "split_size_or_sections")
+        split_dim = get_arg_value(split_node, 2, "dim") or 0
+        
+        if split_input is None or split_sections is None:
+            continue
+        
+        # Get tensor size along split dimension
+        if not hasattr(split_input, 'meta') or 'val' not in split_input.meta:
+            continue
+        
+        input_val = split_input.meta['val']
+        if not isinstance(input_val, torch.Tensor):
+            continue
+        
+        tensor_size = input_val.size(split_dim) if split_dim < input_val.dim() else None
+        if tensor_size is None:
+            continue
+        
+        # Convert split_sections to list if needed
+        if isinstance(split_sections, int):
+            n_sections = (tensor_size + split_sections - 1) // split_sections
+            section_sizes = [split_sections] * (n_sections - 1)
+            section_sizes.append(tensor_size - sum(section_sizes))
+        elif isinstance(split_sections, (list, tuple)):
+            section_sizes = list(split_sections)
+            n_sections = len(section_sizes)
+        else:
+            continue
+        
+        # Find cat nodes that use all getitems from this split
+        getitem_users = [u for u in split_node.users if u.target == operator.getitem]
+        getitem_indices = [get_arg_value(u, 1) for u in getitem_users]
+        
+        for getitem_user in getitem_users:
+            for cat_user in getitem_user.users:
+                if cat_user.target not in (torch.cat, torch.ops.aten.cat.default):
+                    continue
+                
+                cat_dim = get_arg_value(cat_user, 1, "dim") or 0
+                cat_inputs = get_arg_value(cat_user, 0, "tensors") or []
+                
+                # Check if all cat inputs come from this split
+                cat_indices = []
+                all_from_split = True
+                for inp in cat_inputs:
+                    if inp.target == operator.getitem and inp.args[0] == split_node:
+                        cat_indices.append(inp.args[1])
+                    else:
+                        all_from_split = False
+                        break
+                
+                if not all_from_split:
+                    # Verify partial slice
+                    if len(cat_indices) >= 2:
+                        is_valid, msg = verifier.verify_consecutive_indices(cat_indices)
+                        if is_valid:
+                            start_idx = min(cat_indices)
+                            end_idx = max(cat_indices)
+                            is_valid, msg = verifier.verify_partial_slice(
+                                section_sizes, start_idx, end_idx
+                            )
+                        
+                        if not is_valid:
+                            log.warning(f"Z3 split-cat verification failed: {msg}")
+                            counters["inductor"]["z3_splitcat_failed"] += 1
+                        else:
+                            counters["inductor"]["z3_splitcat_verified"] += 1
+                    continue
+                
+                # Verify full split-cat identity
+                is_valid, msg = verifier.verify_consecutive_indices(cat_indices)
+                if not is_valid:
+                    log.warning(f"Z3 split-cat indices not consecutive: {msg}")
+                    counters["inductor"]["z3_splitcat_failed"] += 1
+                    continue
+                
+                # Check dimension match
+                if split_dim != cat_dim:
+                    # Verify dimension mismatch transform
+                    if len(set(section_sizes)) == 1:
+                        is_valid, msg = verifier.verify_dim_mismatch_transform(
+                            split_dim, cat_dim, n_sections, section_sizes[0]
+                        )
+                        if not is_valid:
+                            log.warning(f"Z3 dim mismatch transform failed: {msg}")
+                            counters["inductor"]["z3_splitcat_failed"] += 1
+                            continue
+                    else:
+                        is_valid, msg = verifier.verify_equal_sections_for_unflatten(
+                            section_sizes
+                        )
+                        if not is_valid:
+                            log.warning(f"Z3 unequal sections for unflatten: {msg}")
+                            counters["inductor"]["z3_splitcat_failed"] += 1
+                            continue
+                
+                # Verify identity
+                is_valid, msg = verifier.verify_split_cat_identity(
+                    n_sections, split_dim, cat_dim, tensor_size, section_sizes
+                )
+                
+                if is_valid:
+                    counters["inductor"]["z3_splitcat_verified"] += 1
+                    split_node.meta['z3_splitcat_verified'] = True
+                    cat_user.meta['z3_splitcat_verified'] = True
+                else:
+                    log.warning(f"Z3 split-cat identity failed: {msg}")
+                    counters["inductor"]["z3_splitcat_failed"] += 1
+    
+    # Log summary
+    stats = verifier.get_stats()
+    if stats['total'] > 0:
+        log.info(
+            f"[Z3] Split-cat verification: {stats['verified']}/{stats['total']} verified, "
+            f"{stats['failed']} failed, {stats['skipped']} skipped"
+        )
+
+   
 
 def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     """
@@ -293,6 +444,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
                         print_output=False, include_stride=True, include_device=True
                     ),
                 )
+        if splitcat_z3_enabled:
+            GraphTransformObserver(gm, "verify_splitcat_z3").apply_graph_pass(
+                verify_splitcat_with_z3
+            )
+        
         if config.b2b_gemm_pass:
             B2B_GEMM_PASS.apply(gm.graph)  # type: ignore[arg-type]
 

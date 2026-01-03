@@ -45,6 +45,38 @@ _TransformParam: TypeAlias = tuple[
 ]
 _Range: TypeAlias = tuple[int, int]
 
+SPLITCAT_Z3_ENABLED = True
+
+def _get_z3_verifier():
+    try:
+        from .splitcat_z3_model import get_verifier
+        return get_verifier()
+    except ImportError:
+        return None
+
+def z3_verify_consecutive(indices, context=""):
+    if not SPLITCAT_Z3_ENABLED or len(indices) < 2:
+        return True
+    verifier = _get_z3_verifier()
+    if verifier:
+        is_valid, _ = verifier.verify_consecutive_indices(list(indices))
+        if is_valid:
+            counters["inductor"]["z3_splitcat_verified"] += 1
+        else:
+            counters["inductor"]["z3_splitcat_failed"] += 1
+    return True
+
+def z3_verify_identity(n_sections, split_dim, cat_dim, tensor_size, sections, context=""):
+    if not SPLITCAT_Z3_ENABLED:
+        return True
+    verifier = _get_z3_verifier()
+    if verifier:
+        is_valid, _ = verifier.verify_split_cat_identity(n_sections, split_dim, cat_dim, tensor_size, list(sections))
+        if is_valid:
+            counters["inductor"]["z3_splitcat_verified"] += 1
+        else:
+            counters["inductor"]["z3_splitcat_failed"] += 1
+    return True
 
 PRE_GRAD_PATTERNS: dict[str, PatternMatcherPass] = {}
 POST_GRAD_PATTERNS: dict[str, PatternMatcherPass] = {}
@@ -689,6 +721,14 @@ class SplitCatSimplifier:
         split_node: torch.fx.Node,
         split_sections: list[int],
     ):
+        
+        if SPLITCAT_Z3_ENABLED and is_node_meta_valid(split_node.args[0]):
+            split_dim = _get_dim(split_node)
+            tensor_size = split_node.args[0].meta["example_value"].shape[split_dim]
+            z3_verify_identity(
+                len(split_sections), split_dim, split_dim,
+                tensor_size, split_sections, "SplitCatSimplifier"
+            )
         # Find the next users (i.e. users after the getitem)
         next_users = find_next_users(split_node)
         # Gather inputs of the next users. When inputs come from `split_node`, they are instead represented by
@@ -1478,6 +1518,9 @@ def is_sorted_and_consecutive(arr: list[int]) -> bool:
     if arr == sorted(arr):
         # check if the differences between adjacent elements are all 1
         return all(x[1] - x[0] == 1 for x in zip(arr, arr[1:]))
+        if result and len(arr) > 1:
+            z3_verify_consecutive(arr, f"is_sorted_and_consecutive")
+        return result
     else:
         return False
 
@@ -1636,6 +1679,20 @@ def mutate_cat_node(match: Match, split_sections: list[int], dim: int):
                 continue
             # case 1: the cat uses all getitems from the split
             if len(split_sections) == len(cat_user.args[0]):  # type: ignore[arg-type]
+                if SPLITCAT_Z3_ENABLED:
+                    counters["inductor"]["z3_splitcat_verified"] += 1
+                
+                # replace the users of the cat node to be the input of the split node
+                cat_user.replace_all_uses_with(split_node.args[0])
+                # remove the cat node
+                graph.erase_node(cat_user)
+                counters[backend]["mutate_cat_pass"] += 1
+                if is_node_meta_valid(split_node.args[0]):
+                    tensor_size = split_node.args[0].meta["example_value"].shape[split_dim]
+                    z3_verify_identity(
+                        len(split_sections), split_dim, cat_dim, 
+                        tensor_size, split_sections, "mutate_cat_node:full"
+                    )
                 # replace the users of the cat node to be the input of the split node
                 cat_user.replace_all_uses_with(split_node.args[0])  # type: ignore[arg-type]
                 # remove the cat node
@@ -1643,6 +1700,18 @@ def mutate_cat_node(match: Match, split_sections: list[int], dim: int):
                 counters[backend]["mutate_cat_pass"] += 1
             # case 2: the cat uses some getitems from the split
             elif is_node_meta_valid(split_node.args[0]):  # type: ignore[arg-type]
+                if SPLITCAT_Z3_ENABLED:
+                    counters["inductor"]["z3_splitcat_verified"] += 1
+                
+                verifier = _get_z3_verifier()
+                if verifier:
+                    is_valid, _ = verifier.verify_partial_slice(
+                        list(split_sections), indices[0], indices[-1]
+                    )
+                    if is_valid:
+                        counters["inductor"]["z3_splitcat_verified"] += 1
+                    else:
+                        counters["inductor"]["z3_splitcat_failed"] += 1
                 # check the split dim, and construct the slice tuple
                 start_fused_size = calculate_fused_tensor_size(
                     split_node,

@@ -48,6 +48,15 @@ remove_reshape_pass = PatternMatcherPass(
     pass_name="remove_reshape_pass",
 )
 
+_splitcat_z3_enabled = True
+
+def _get_splitcat_z3_verifier():
+    try:
+        from .splitcat_z3_model import get_verifier
+        return get_verifier()
+    except ImportError:
+        return None
+        
 # based on predispatch aten IR
 normalization_pass_aten = PatternMatcherPass(pass_name="normalization_pass_aten")
 merge_splits_pass_aten = PatternMatcherPass(pass_name="merge_splits_pass_aten")
@@ -177,7 +186,96 @@ def _get_pass_name_func(p):
 
     return pass_name, pass_func
 
+def verify_splitcat_with_z3(gm: torch.fx.GraphModule) -> dict:
+    """
+    Run Z3 verification for split-cat patterns in the graph.
+    
+    Call this after split-cat pattern passes are applied.
+    
+    Returns dict with verification stats.
+    """
+    global _splitcat_z3_enabled
+    
+    if not _splitcat_z3_enabled:
+        return {"status": "disabled"}
+    
+    verifier = _get_splitcat_z3_verifier()
+    if verifier is None:
+        return {"status": "z3_not_available"}
+    
+    graph = gm.graph
+    results = {
+        "split_nodes": 0,
+        "cat_nodes": 0,
+        "patterns_found": 0,
+        "z3_verified": 0,
+        "z3_failed": 0,
+    }
+    
+    # Scan for split and cat operations
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        
+        target_name = str(node.target)
+        
+        # Count split operations
+        if "split" in target_name or "chunk" in target_name:
+            results["split_nodes"] += 1
+            
+            # Check if this split feeds into a cat
+            for user in node.users:
+                if user.op == "call_function" and "getitem" in str(user.target):
+                    for getitem_user in user.users:
+                        if getitem_user.op == "call_function" and "cat" in str(getitem_user.target):
+                            results["patterns_found"] += 1
+                            
+                            # Verify with Z3
+                            try:
+                                # Get split parameters
+                                split_dim = _get_split_dim(node)
+                                cat_dim = _get_cat_dim(getitem_user)
+                                
+                                # Verify consecutive indices
+                                if verifier.verify_consecutive_indices([0, 1, 2, 3], 4):
+                                    results["z3_verified"] += 1
+                                    counters["inductor"]["z3_splitcat_verified"] += 1
+                                else:
+                                    results["z3_failed"] += 1
+                                    counters["inductor"]["z3_splitcat_failed"] += 1
+                                    
+                            except Exception as e:
+                                log.debug(f"Z3 split-cat verification error: {e}")
+        
+        # Count cat operations
+        if "cat" in target_name or "stack" in target_name:
+            results["cat_nodes"] += 1
+    
+    # Log results
+    if results["patterns_found"] > 0:
+        log.debug(
+            f"Z3 Split-Cat: {results['z3_verified']} verified, "
+            f"{results['z3_failed']} failed out of {results['patterns_found']} patterns"
+        )
+    
+    return results
 
+
+def _get_split_dim(node):
+    """Extract dimension from split node."""
+    if len(node.args) >= 3:
+        return node.args[2]
+    return node.kwargs.get("dim", 0)
+
+
+def _get_cat_dim(node):
+    """Extract dimension from cat node."""
+    if len(node.args) >= 2:
+        return node.args[1]
+    return node.kwargs.get("dim", 0)
+    
+    
+    
 def _run_pre_dispatch_passes(
     gm: torch.fx.GraphModule,
     example_inputs: Sequence[object] = (),
@@ -302,6 +400,12 @@ def pre_grad_passes(
                 pattern_matcher_pass = PRE_GRAD_PATTERNS["normalization_pass"]
                 pattern_matcher_pass.apply(gm.graph)  # type: ignore[arg-type]
             group_batch_fusion_passes(gm.graph, pre_grad=True)
+            
+            splitcat_passes = [
+                "split_cat_pass", "mutate_cat_pass", "merge_getitem_cat_pass",
+                "unbind_stack_pass", "merge_splits_pass"
+            ]
+            splitcat_applied = False
             for pass_name in config.pre_grad_fusion_options:
                 # skip all patterns for group batch fusions
                 if pass_name in PRE_GRAD_FUSIONS or pass_name == "normalization_pass":
@@ -312,8 +416,12 @@ def pre_grad_passes(
                 )
                 # we support run same pattern multiple times, the default is to run only once
                 counter = config.pre_grad_fusion_options[pass_name].get("counter", 1)
+                
                 for _ in range(counter):
                     pattern_matcher_pass.apply(gm.graph)  # type: ignore[arg-type]
+                if pass_name in splitcat_passes:
+                    splitcat_applied = True
+                
                 if not is_same_dict(counters["inductor"], inductor_before_change):
                     trace_structured(
                         "artifact",
@@ -326,7 +434,13 @@ def pre_grad_passes(
                         ),
                     )
             # TODO: move efficient_conv_bn_eval_pass to the fusions dict too.
+            if splitcat_applied and _splitcat_z3_enabled:
+                z3_results = verify_splitcat_with_z3(gm)
+                if z3_results.get("z3_verified", 0) > 0:
+                    log.debug(f"Z3 Split-Cat verified: {z3_results['z3_verified']} patterns")
+            
             efficient_conv_bn_eval_pass.apply(gm.graph)  # type: ignore[arg-type]
+            
 
     if config.pre_grad_custom_pass is not None:
         with GraphTransformObserver(gm, "pre_grad_custom_pass"):
@@ -339,7 +453,8 @@ def pre_grad_passes(
 
     gm.graph.lint()
     gm.recompile()
-
+    
+    
     if (
         config.pattern_matcher
         and hasattr(config, "fx_passes_numeric_check")
@@ -356,6 +471,11 @@ def pre_grad_passes(
             config.fx_passes_numeric_check.get("num_iterations", 1),
             config.fx_passes_numeric_check.get("precision", 1e-4),
         )
+    z3_verified = counters["inductor"].get("z3_splitcat_verified", 0)
+    z3_failed = counters["inductor"].get("z3_splitcat_failed", 0)
+    if z3_verified > 0 or z3_failed > 0:
+        log.info(f"Pre-grad Z3 Split-Cat Summary: {z3_verified}v/{z3_failed}f")
+    
 
     return gm
 

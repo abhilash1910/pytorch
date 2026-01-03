@@ -613,7 +613,14 @@ class PreconditionChecker:
         promoted = torch.promote_types(other_meta.dtype, weight_dtype)
         has_type_promotion_val = (promoted != weight_dtype)
         
-        mixed_allowed_val = computation_node.meta.get("_allow_mixed_dtype_folding", False)
+        mixed_allowed_raw = computation_node.meta.get("_allow_mixed_dtype_folding", False)
+        if isinstance(mixed_allowed_raw, bool):
+            mixed_allowed_val = mixed_allowed_raw
+        else:
+            # If metadata contains unexpected type (like torch.dtype), default to False
+            mixed_allowed_val = False
+            
+        #mixed_allowed_val = computation_node.meta.get("_allow_mixed_dtype_folding", False)
         other_is_float32_val = (other_meta.dtype == torch.float32)
         weight_is_low_precision_val = (weight_dtype in (torch.float16, torch.bfloat16))
         
