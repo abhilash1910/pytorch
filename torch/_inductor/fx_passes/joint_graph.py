@@ -38,6 +38,33 @@ from ..pattern_matcher import (
 from .decompose_mem_bound_mm import check_device
 from .replace_random import replace_random_passes
 
+_z3_joint_graph_enabled = True
+_z3_joint_graph_verifier = None
+
+def _get_z3_joint_graph_verifier():
+    global _z3_joint_graph_verifier
+    if _z3_joint_graph_verifier is None:
+        try:
+            from .joint_graph_z3 import get_verifier
+            _z3_joint_graph_verifier = get_verifier()
+        except ImportError:
+            _z3_joint_graph_verifier = False
+    return _z3_joint_graph_verifier if _z3_joint_graph_verifier else None
+    
+def _verify_joint_graph_optimizations(gm: torch.fx.GraphModule) -> None:
+    if not _z3_joint_graph_enabled:
+        return
+    verifier = _get_z3_joint_graph_verifier()
+    if verifier is None:
+        return
+    try:
+        verifier.reset_stats()
+        verifier.verify_all()
+        stats = verifier.get_stats()
+        counters["inductor"]["z3_joint_graph_verified"] += stats["verified"]
+        counters["inductor"]["z3_joint_graph_failed"] += stats["failed"]
+    except Exception as e:
+        log.debug(f"Z3 verification error: {e}")
 
 log = logging.getLogger(__name__)
 patterns = PatternMatcherPass()
@@ -611,6 +638,7 @@ def joint_graph_passes(graph: torch.fx.GraphModule):
             config.joint_custom_post_pass
         )
         count += 1
+    _verify_joint_graph_optimizations(graph)
 
     if count:
         stable_topological_sort(graph.graph)
