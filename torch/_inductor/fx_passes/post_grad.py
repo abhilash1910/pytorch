@@ -65,9 +65,11 @@ from .reinplace import reinplace_inplaceable_ops
 from .split_cat import POST_GRAD_PATTERNS
 from .reinplace_z3 import Z3ReinplaceVerifier
 from .split_cat_z3 import Z3SplitCatVerifier
+from .group_batch_fusion_z3 import Z3GroupBatchFusionVerifier, get_verifier as get_group_batch_verifier, verify_group_batch_fusion
 
 reinplace_z3_enabled = True
 splitcat_z3_enabled = True
+group_batch_z3_enabled = True
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -361,6 +363,144 @@ def verify_splitcat_with_z3(graph: torch.fx.Graph) -> None:
         )
 
    
+def verify_group_batch_fusion_with_z3(graph: torch.fx.Graph) -> None:
+    if not group_batch_z3_enabled:
+        return
+    
+    try:
+        verifier = get_group_batch_verifier()
+    except Exception as e:
+        log.warning(f"group_batch_fusion_z3 not available: {e}")
+        return
+    
+    if not verifier.enabled:
+        return
+    
+    nodes = list(graph.nodes)
+    verified_count = 0
+    failed_count = 0
+    
+    stack_nodes = []
+    unbind_nodes = []
+    cat_nodes = []
+    split_nodes = []
+    bmm_nodes = []
+    addmm_nodes = []
+    layernorm_nodes = []
+    pointwise_nodes = []
+    math_nodes = []
+    
+    for node in nodes:
+        if node.op != "call_function":
+            continue
+        
+        target = node.target
+        
+        if target == aten.stack.default:
+            stack_nodes.append(node)
+        elif target == aten.unbind.int:
+            unbind_nodes.append(node)
+        elif target == aten.cat.default:
+            cat_nodes.append(node)
+        elif target in (aten.split.Tensor, aten.split_with_sizes.default):
+            split_nodes.append(node)
+        elif target == aten.bmm.default:
+            bmm_nodes.append(node)
+        elif target == aten.addmm.default:
+            addmm_nodes.append(node)
+        elif target == torch.nn.functional.layer_norm:
+            layernorm_nodes.append(node)
+        elif target in (aten.relu.default, aten.sigmoid.default, aten.tanh.default):
+            pointwise_nodes.append(node)
+        elif target in (aten.clamp.default, aten.nan_to_num.default, aten.detach.default):
+            math_nodes.append(node)
+    
+    for stack_node in stack_nodes:
+        for user in stack_node.users:
+            if user in unbind_nodes:
+                proved, msg = verifier.prove_stack_unbind_no_mutation()
+                if proved:
+                    verified_count += 1
+                    counters["inductor"]["z3_group_batch_verified"] += 1
+                    stack_node.meta['z3_group_batch_verified'] = True
+                else:
+                    failed_count += 1
+                    counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    for cat_node in cat_nodes:
+        for user in cat_node.users:
+            if user in split_nodes:
+                proved, msg = verifier.prove_cat_split_identity()
+                if proved:
+                    verified_count += 1
+                    counters["inductor"]["z3_group_batch_verified"] += 1
+                    cat_node.meta['z3_group_batch_verified'] = True
+                else:
+                    failed_count += 1
+                    counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    for bmm_node in bmm_nodes:
+        proved, msg = verifier.prove_bmm_decomposition()
+        if proved:
+            verified_count += 1
+            counters["inductor"]["z3_group_batch_verified"] += 1
+            bmm_node.meta['z3_group_batch_verified'] = True
+        else:
+            failed_count += 1
+            counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    for addmm_node in addmm_nodes:
+        proved, msg = verifier.prove_addmm_fusion()
+        if proved:
+            verified_count += 1
+            counters["inductor"]["z3_group_batch_verified"] += 1
+            addmm_node.meta['z3_group_batch_verified'] = True
+        else:
+            failed_count += 1
+            counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    for layernorm_node in layernorm_nodes:
+        proved, msg = verifier.prove_batch_layernorm_fusion()
+        if proved:
+            verified_count += 1
+            counters["inductor"]["z3_group_batch_verified"] += 1
+            layernorm_node.meta['z3_group_batch_verified'] = True
+        else:
+            failed_count += 1
+            counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    for pw_node in pointwise_nodes:
+        proved, msg = verifier.prove_pointwise_batching()
+        if proved:
+            verified_count += 1
+            counters["inductor"]["z3_group_batch_verified"] += 1
+            pw_node.meta['z3_group_batch_verified'] = True
+        else:
+            failed_count += 1
+            counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    for math_node in math_nodes:
+        proved, msg = verifier.prove_batch_math_ops()
+        if proved:
+            verified_count += 1
+            counters["inductor"]["z3_group_batch_verified"] += 1
+            math_node.meta['z3_group_batch_verified'] = True
+        else:
+            failed_count += 1
+            counters["inductor"]["z3_group_batch_failed"] += 1
+    
+    proved, msg = verifier.prove_independent_subset_safety()
+    if proved:
+        counters["inductor"]["z3_group_batch_independent_subset"] += 1
+    
+    proved, msg = verifier.prove_no_dependency_cycle()
+    if proved:
+        counters["inductor"]["z3_group_batch_no_cycle"] += 1
+    
+    if verified_count > 0 or failed_count > 0:
+        log.info(
+            f"[Z3] Group batch fusion verification: {verified_count} verified, {failed_count} failed"
+        )
 
 def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     """
@@ -414,6 +554,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         GraphTransformObserver(gm, "post_grad_custom_pre_pass").apply_graph_pass(
             functools.partial(group_batch_fusion_passes, pre_grad=False)
         )
+        if group_batch_z3_enabled:
+            GraphTransformObserver(gm, "verify_group_batch_fusion_z3").apply_graph_pass(
+                verify_group_batch_fusion_with_z3
+            )
+        
         GraphTransformObserver(gm, "remove_noop_ops").apply_graph_pass(remove_noop_ops)
         GraphTransformObserver(gm, "remove_assert_ops").apply_graph_pass(
             remove_assert_ops
@@ -603,7 +748,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
                 f"[Z3] Pad MM verification: {stats['verified']}/{stats['total']} verified, "
                 f"{stats['failed']} failed, {stats['skipped']} skipped"
             )
-        
+        gb_verifier = get_group_batch_verifier()
+        gb_stats = gb_verifier.get_stats()
+        if gb_stats['total'] > 0:
+            log.info(
+                f"[Z3] Group batch fusion verification: {gb_stats['verified']}/{gb_stats['total']} verified, "
+                f"{gb_stats['failed']} failed"
+            )
         
         #=================sdpa=====
         from .fuse_attention import _sfdp_init
